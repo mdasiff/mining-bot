@@ -17,11 +17,9 @@ async function ensureFiles() {
   try {
     await fs.access(URL_FILE);
   } catch {
-    const starter = {
-      urls: [
-        'https://example.com'
-      ]
-    };
+    const starter = [
+      'https://example.com'
+    ];
     await fs.writeFile(URL_FILE, JSON.stringify(starter, null, 2));
   }
 
@@ -45,22 +43,48 @@ function sanitizeConfig() {
   return cfg;
 }
 
+function normalizeUrlsFromParsedJson(parsed) {
+  if (Array.isArray(parsed)) {
+    return parsed;
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    if (Array.isArray(parsed.urls)) {
+      return parsed.urls;
+    }
+
+    return Object.keys(parsed);
+  }
+
+  return [];
+}
+
+function extractUrlsFromRawText(raw) {
+  return raw.match(/https?:\/\/[^\s",}]+/g) || [];
+}
+
 async function readUrls() {
   const raw = await fs.readFile(URL_FILE, 'utf8');
-  const parsed = JSON.parse(raw);
+  let urls = [];
 
-  const urls = Array.isArray(parsed) ? parsed : parsed.urls;
+  try {
+    const parsed = JSON.parse(raw);
+    urls = normalizeUrlsFromParsedJson(parsed);
+  } catch {
+    // Fallback for non-standard input formats by extracting URLs from text.
+    urls = extractUrlsFromRawText(raw);
+  }
 
   if (!Array.isArray(urls) || urls.length === 0) {
-    throw new Error('url.json must contain an array of URLs (or {"urls": [...]})');
+    throw new Error('url.json must contain URLs, e.g. ["https://site1", "https://site2"]');
   }
 
   const cleanUrls = urls
     .map((u) => (typeof u === 'string' ? u.trim() : ''))
-    .filter(Boolean);
+    .filter((u) => /^https?:\/\//i.test(u));
 
   if (cleanUrls.length === 0) {
-    throw new Error('url.json has no valid URL strings');
+    throw new Error('url.json has no valid http/https URLs');
   }
 
   return cleanUrls;
@@ -173,37 +197,10 @@ async function runPool(urls, config) {
       await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
     }
   }
-}
 
-async function runPool(urls, config) {
-  const browser = await puppeteer.launch({
-    headless: config.headless,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
+  const workerTasks = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
 
-  const results = [];
-  let cursor = 0;
-
-  async function worker() {
-    while (cursor < urls.length) {
-      const index = cursor++;
-      const url = urls[index];
-
-      const result = await scrapeUrl(browser, url, config, index, urls.length);
-      results[index] = result;
-
-      await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
-
-  await Promise.all(workers);
-  await browser.close();
-
-  const workers = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
-
-  await Promise.all(workers);
+  await Promise.all(workerTasks);
   await browser.close();
 
   return results;
