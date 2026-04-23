@@ -78,7 +78,7 @@ async function scrapeUrl(browser, url, config, index, total) {
     await page.setUserAgent(USER_AGENTS[index % USER_AGENTS.length]);
     await page.setViewport({ width: 1366, height: 768 });
 
-    await page.goto(url, {
+    const response = await page.goto(url, {
       waitUntil: 'domcontentloaded',
       timeout: config.navigationTimeoutMs
     });
@@ -90,10 +90,38 @@ async function scrapeUrl(browser, url, config, index, total) {
       const text = document.body?.innerText || '';
       const hasPrice = /₹|\$|€|£/.test(text);
 
+      const metadata = Array.from(document.querySelectorAll('meta'))
+        .map((meta) => ({
+          name: meta.getAttribute('name') || meta.getAttribute('property') || meta.getAttribute('http-equiv') || null,
+          content: meta.getAttribute('content') || ''
+        }))
+        .filter((meta) => meta.name && meta.content);
+
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+        .map((node) => node.textContent?.trim())
+        .filter(Boolean);
+
+      const links = Array.from(document.querySelectorAll('a[href]'))
+        .map((a) => ({
+          text: a.textContent?.trim() || '',
+          href: a.href
+        }))
+        .filter((link) => link.href)
+        .slice(0, 500);
+
       return {
         title,
         hasPrice,
-        extractedAt: new Date().toISOString()
+        extractedAt: new Date().toISOString(),
+        page: {
+          url: window.location.href,
+          documentTitle: document.title,
+          html: document.documentElement.outerHTML,
+          text
+        },
+        metadata,
+        headings,
+        links
       };
     });
 
@@ -104,6 +132,10 @@ async function scrapeUrl(browser, url, config, index, total) {
       url,
       startedAt,
       endedAt: new Date().toISOString(),
+      response: {
+        status: response?.status() ?? null,
+        ok: response?.ok() ?? null
+      },
       data
     };
   } catch (error) {
@@ -141,6 +173,33 @@ async function runPool(urls, config) {
       await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
     }
   }
+}
+
+async function runPool(urls, config) {
+  const browser = await puppeteer.launch({
+    headless: config.headless,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+
+  const results = [];
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < urls.length) {
+      const index = cursor++;
+      const url = urls[index];
+
+      const result = await scrapeUrl(browser, url, config, index, urls.length);
+      results[index] = result;
+
+      await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
+
+  await Promise.all(workers);
+  await browser.close();
 
   const workers = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
 
