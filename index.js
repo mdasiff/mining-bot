@@ -1,25 +1,12 @@
 const fs = require('fs/promises');
 const path = require('path');
 const puppeteer = require('puppeteer');
+const { DEFAULT_CONFIG, USER_AGENTS } = require('./config/const');
 
 const JSON_DIR = path.join(__dirname, 'json-files');
 const URL_FILE = path.join(JSON_DIR, 'url.json');
 const OUTPUT_FILE = path.join(JSON_DIR, 'output.json');
 const LOG_FILE = path.join(JSON_DIR, 'log.json');
-
-const DEFAULT_CONFIG = {
-  concurrency: 3,
-  minDelayMs: 1500,
-  maxDelayMs: 4000,
-  navigationTimeoutMs: 45000,
-  headless: false
-};
-
-const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36'
-];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -33,8 +20,7 @@ async function ensureFiles() {
     const starter = {
       urls: [
         'https://example.com'
-      ],
-      config: DEFAULT_CONFIG
+      ]
     };
     await fs.writeFile(URL_FILE, JSON.stringify(starter, null, 2));
   }
@@ -48,7 +34,18 @@ async function ensureFiles() {
   }
 }
 
-async function readUrlConfig() {
+function sanitizeConfig() {
+  const cfg = { ...DEFAULT_CONFIG };
+
+  cfg.concurrency = Math.max(1, Number(cfg.concurrency) || DEFAULT_CONFIG.concurrency);
+  cfg.minDelayMs = Math.max(300, Number(cfg.minDelayMs) || DEFAULT_CONFIG.minDelayMs);
+  cfg.maxDelayMs = Math.max(cfg.minDelayMs, Number(cfg.maxDelayMs) || DEFAULT_CONFIG.maxDelayMs);
+  cfg.navigationTimeoutMs = Math.max(10000, Number(cfg.navigationTimeoutMs) || DEFAULT_CONFIG.navigationTimeoutMs);
+
+  return cfg;
+}
+
+async function readUrls() {
   const raw = await fs.readFile(URL_FILE, 'utf8');
   const parsed = JSON.parse(raw);
 
@@ -66,17 +63,7 @@ async function readUrlConfig() {
     throw new Error('url.json has no valid URL strings');
   }
 
-  const cfg = {
-    ...DEFAULT_CONFIG,
-    ...(parsed.config || {})
-  };
-
-  cfg.concurrency = Math.max(1, Number(cfg.concurrency) || DEFAULT_CONFIG.concurrency);
-  cfg.minDelayMs = Math.max(300, Number(cfg.minDelayMs) || DEFAULT_CONFIG.minDelayMs);
-  cfg.maxDelayMs = Math.max(cfg.minDelayMs, Number(cfg.maxDelayMs) || DEFAULT_CONFIG.maxDelayMs);
-  cfg.navigationTimeoutMs = Math.max(10000, Number(cfg.navigationTimeoutMs) || DEFAULT_CONFIG.navigationTimeoutMs);
-
-  return { urls: cleanUrls, config: cfg };
+  return cleanUrls;
 }
 
 async function writeJson(file, data) {
@@ -166,7 +153,9 @@ async function runPool(urls, config) {
 (async () => {
   try {
     await ensureFiles();
-    const { urls, config } = await readUrlConfig();
+
+    const urls = await readUrls();
+    const config = sanitizeConfig();
 
     console.log(`Starting scrape for ${urls.length} URLs in one browser instance...`);
     console.log(`Config: ${JSON.stringify(config)}`);
