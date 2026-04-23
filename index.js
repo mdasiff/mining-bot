@@ -173,6 +173,33 @@ async function runPool(urls, config) {
       await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
     }
   }
+}
+
+async function runPool(urls, config) {
+  const browser = await puppeteer.launch({
+    headless: config.headless,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+
+  const results = [];
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < urls.length) {
+      const index = cursor++;
+      const url = urls[index];
+
+      const result = await scrapeUrl(browser, url, config, index, urls.length);
+      results[index] = result;
+
+      await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
+
+  await Promise.all(workers);
+  await browser.close();
 
   const workers = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
 
