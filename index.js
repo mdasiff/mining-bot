@@ -1,48 +1,197 @@
+const fs = require('fs/promises');
+const path = require('path');
 const puppeteer = require('puppeteer');
 
-(async () => {
-  const url = process.argv[2] || 'https://www.99acres.com/2-bhk-bedroom-independent-house-villa-for-sale-in-pratap-nagar-jaipur-500-sq-ft-r1-spid-D60627190';
+const JSON_DIR = path.join(__dirname, 'json-files');
+const URL_FILE = path.join(JSON_DIR, 'url.json');
+const OUTPUT_FILE = path.join(JSON_DIR, 'output.json');
+const LOG_FILE = path.join(JSON_DIR, 'log.json');
 
-  console.log("Opening:", url);
+const DEFAULT_CONFIG = {
+  concurrency: 3,
+  minDelayMs: 1500,
+  maxDelayMs: 4000,
+  navigationTimeoutMs: 45000,
+  headless: false
+};
 
-  const browser = await puppeteer.launch({
-    headless: false, // 👈 IMPORTANT (use real browser mode)
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox'
-    ]
-  });
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36'
+];
 
-  const page = await browser.newPage();
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
-  await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
-  );
-
-  await page.setViewport({ width: 1366, height: 768 });
+async function ensureFiles() {
+  await fs.mkdir(JSON_DIR, { recursive: true });
 
   try {
+    await fs.access(URL_FILE);
+  } catch {
+    const starter = {
+      urls: [
+        'https://example.com'
+      ],
+      config: DEFAULT_CONFIG
+    };
+    await fs.writeFile(URL_FILE, JSON.stringify(starter, null, 2));
+  }
+
+  for (const file of [OUTPUT_FILE, LOG_FILE]) {
+    try {
+      await fs.access(file);
+    } catch {
+      await fs.writeFile(file, '[]');
+    }
+  }
+}
+
+async function readUrlConfig() {
+  const raw = await fs.readFile(URL_FILE, 'utf8');
+  const parsed = JSON.parse(raw);
+
+  const urls = Array.isArray(parsed) ? parsed : parsed.urls;
+
+  if (!Array.isArray(urls) || urls.length === 0) {
+    throw new Error('url.json must contain an array of URLs (or {"urls": [...]})');
+  }
+
+  const cleanUrls = urls
+    .map((u) => (typeof u === 'string' ? u.trim() : ''))
+    .filter(Boolean);
+
+  if (cleanUrls.length === 0) {
+    throw new Error('url.json has no valid URL strings');
+  }
+
+  const cfg = {
+    ...DEFAULT_CONFIG,
+    ...(parsed.config || {})
+  };
+
+  cfg.concurrency = Math.max(1, Number(cfg.concurrency) || DEFAULT_CONFIG.concurrency);
+  cfg.minDelayMs = Math.max(300, Number(cfg.minDelayMs) || DEFAULT_CONFIG.minDelayMs);
+  cfg.maxDelayMs = Math.max(cfg.minDelayMs, Number(cfg.maxDelayMs) || DEFAULT_CONFIG.maxDelayMs);
+  cfg.navigationTimeoutMs = Math.max(10000, Number(cfg.navigationTimeoutMs) || DEFAULT_CONFIG.navigationTimeoutMs);
+
+  return { urls: cleanUrls, config: cfg };
+}
+
+async function writeJson(file, data) {
+  await fs.writeFile(file, JSON.stringify(data, null, 2));
+}
+
+async function scrapeUrl(browser, url, config, index, total) {
+  const page = await browser.newPage();
+  const startedAt = new Date().toISOString();
+
+  try {
+    await page.setUserAgent(USER_AGENTS[index % USER_AGENTS.length]);
+    await page.setViewport({ width: 1366, height: 768 });
+
     await page.goto(url, {
       waitUntil: 'domcontentloaded',
-      timeout: 0
+      timeout: config.navigationTimeoutMs
     });
 
-    // wait for page to fully render
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    await sleep(randomInt(1200, 3000));
 
     const data = await page.evaluate(() => {
+      const title = document.querySelector('h1')?.innerText?.trim() || document.title || 'not found';
+      const text = document.body?.innerText || '';
+      const hasPrice = /₹|\$|€|£/.test(text);
+
       return {
-        title: document.querySelector('h1')?.innerText || 'not found',
-        price: document.body.innerText.includes('₹') ? 'Price present' : 'No price found'
+        title,
+        hasPrice,
+        extractedAt: new Date().toISOString()
       };
     });
 
-    console.log("Extracted Data:", data);
+    console.log(`[${index + 1}/${total}] ✅ ${url}`);
 
-  } catch (err) {
-    console.error("Error:", err.message);
+    return {
+      status: 'success',
+      url,
+      startedAt,
+      endedAt: new Date().toISOString(),
+      data
+    };
+  } catch (error) {
+    console.log(`[${index + 1}/${total}] ❌ ${url} -> ${error.message}`);
+
+    return {
+      status: 'error',
+      url,
+      startedAt,
+      endedAt: new Date().toISOString(),
+      error: error.message
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+async function runPool(urls, config) {
+  const browser = await puppeteer.launch({
+    headless: config.headless,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+
+  const results = [];
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < urls.length) {
+      const index = cursor++;
+      const url = urls[index];
+
+      const result = await scrapeUrl(browser, url, config, index, urls.length);
+      results[index] = result;
+
+      await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
+    }
   }
 
-  // keep browser open for debugging
-  // await browser.close();
+  const workers = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
+
+  await Promise.all(workers);
+  await browser.close();
+
+  return results;
+}
+
+(async () => {
+  try {
+    await ensureFiles();
+    const { urls, config } = await readUrlConfig();
+
+    console.log(`Starting scrape for ${urls.length} URLs in one browser instance...`);
+    console.log(`Config: ${JSON.stringify(config)}`);
+
+    const results = await runPool(urls, config);
+    const output = results.filter((entry) => entry.status === 'success');
+    const logs = results.map((entry) => ({
+      url: entry.url,
+      status: entry.status,
+      startedAt: entry.startedAt,
+      endedAt: entry.endedAt,
+      error: entry.error || null
+    }));
+
+    await writeJson(OUTPUT_FILE, output);
+    await writeJson(LOG_FILE, logs);
+
+    const successCount = output.length;
+    const errorCount = logs.length - successCount;
+
+    console.log(`Completed. Success: ${successCount}, Error: ${errorCount}`);
+    console.log(`Output file: ${OUTPUT_FILE}`);
+    console.log(`Log file: ${LOG_FILE}`);
+  } catch (error) {
+    console.error(`Fatal error: ${error.message}`);
+    process.exitCode = 1;
+  }
 })();

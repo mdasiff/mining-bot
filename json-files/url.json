@@ -1,0 +1,12 @@
+{
+  "urls": [
+    "https://example.com"
+  ],
+  "config": {
+    "concurrency": 3,
+    "minDelayMs": 1500,
+    "maxDelayMs": 4000,
+    "navigationTimeoutMs": 45000,
+    "headless": false
+  }
+}
