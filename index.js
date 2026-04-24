@@ -11,6 +11,36 @@ const LOG_FILE = path.join(JSON_DIR, 'log.json');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
+function createUserAgentPicker() {
+  let pool = [];
+
+  return () => {
+    if (pool.length === 0) {
+      pool = [...USER_AGENTS]
+        .map((ua) => ({ ua, sort: Math.random() }))
+        .sort((a, b) => a.sort - b.sort)
+        .map((item) => item.ua);
+    }
+
+    return pool.pop();
+  };
+}
+
+async function simulateHumanBehavior(page, config) {
+  const totalHeight = await page.evaluate(() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+  const steps = randomInt(4, 8);
+
+  for (let i = 1; i <= steps; i += 1) {
+    const nextY = Math.min(totalHeight, Math.floor((totalHeight / steps) * i));
+    await page.mouse.move(randomInt(120, 1200), randomInt(120, 700), { steps: randomInt(8, 20) });
+    await page.evaluate((y) => window.scrollTo({ top: y, behavior: 'smooth' }), nextY);
+    await sleep(randomInt(500, 1400));
+  }
+
+  await page.mouse.click(randomInt(60, 1100), randomInt(100, 650), { delay: randomInt(50, 180) });
+  await sleep(randomInt(config.preExtractWaitMsMin, config.preExtractWaitMsMax));
+}
+
 async function ensureFiles() {
   await fs.mkdir(JSON_DIR, { recursive: true });
 
@@ -32,10 +62,12 @@ async function ensureFiles() {
 function sanitizeConfig() {
   const cfg = { ...DEFAULT_CONFIG };
 
-  cfg.concurrency = Math.max(1, Number(cfg.concurrency) || DEFAULT_CONFIG.concurrency);
-  cfg.minDelayMs = Math.max(300, Number(cfg.minDelayMs) || DEFAULT_CONFIG.minDelayMs);
-  cfg.maxDelayMs = Math.max(cfg.minDelayMs, Number(cfg.maxDelayMs) || DEFAULT_CONFIG.maxDelayMs);
+  cfg.concurrency = Math.min(2, Math.max(1, Number(cfg.concurrency) || DEFAULT_CONFIG.concurrency));
+  cfg.minDelayMs = Math.max(5000, Number(cfg.minDelayMs) || DEFAULT_CONFIG.minDelayMs);
+  cfg.maxDelayMs = Math.max(15000, cfg.minDelayMs, Number(cfg.maxDelayMs) || DEFAULT_CONFIG.maxDelayMs);
   cfg.navigationTimeoutMs = Math.max(10000, Number(cfg.navigationTimeoutMs) || DEFAULT_CONFIG.navigationTimeoutMs);
+  cfg.preExtractWaitMsMin = Math.max(1000, Number(cfg.preExtractWaitMsMin) || DEFAULT_CONFIG.preExtractWaitMsMin);
+  cfg.preExtractWaitMsMax = Math.max(cfg.preExtractWaitMsMin, Number(cfg.preExtractWaitMsMax) || DEFAULT_CONFIG.preExtractWaitMsMax);
 
   return cfg;
 }
@@ -95,12 +127,12 @@ async function writeJson(file, data) {
   await fs.writeFile(file, JSON.stringify(data, null, 2));
 }
 
-async function scrapeUrl(browser, url, selectors, config, index, total) {
+async function scrapeUrl(browser, url, selectors, config, index, total, pickUserAgent) {
   const page = await browser.newPage();
   const startedAt = new Date().toISOString();
 
   try {
-    await page.setUserAgent(USER_AGENTS[index % USER_AGENTS.length]);
+    await page.setUserAgent(pickUserAgent());
     await page.setViewport({ width: 1366, height: 768 });
 
     const response = await page.goto(url, {
@@ -108,7 +140,7 @@ async function scrapeUrl(browser, url, selectors, config, index, total) {
       timeout: config.navigationTimeoutMs
     });
 
-    await sleep(randomInt(1200, 3000));
+    await simulateHumanBehavior(page, config);
 
     const extracted = await page.evaluate((selectorMap) => {
       const pickValue = (selector) => {
@@ -192,13 +224,14 @@ function runPool(urls, selectors, config) {
     .then((browser) => {
       const results = [];
       let cursor = 0;
+      const pickUserAgent = createUserAgentPicker();
 
       const worker = async () => {
         while (cursor < urls.length) {
           const index = cursor++;
           const url = urls[index];
 
-          const result = await scrapeUrl(browser, url, selectors, config, index, urls.length);
+          const result = await scrapeUrl(browser, url, selectors, config, index, urls.length, pickUserAgent);
           results[index] = result;
 
           await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
