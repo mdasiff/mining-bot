@@ -27,6 +27,8 @@ function createUserAgentPicker() {
 }
 
 async function simulateHumanBehavior(page, config) {
+  await sleep(randomInt(config.postLoadWaitMsMin, config.postLoadWaitMsMax));
+
   const totalHeight = await page.evaluate(() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
   const steps = randomInt(4, 8);
 
@@ -37,9 +39,16 @@ async function simulateHumanBehavior(page, config) {
     await sleep(randomInt(500, 1400));
   }
 
+  await sleep(randomInt(config.postScrollWaitMsMin, config.postScrollWaitMsMax));
   await page.mouse.click(randomInt(60, 1100), randomInt(100, 650), { delay: randomInt(50, 180) });
+
+  if (Math.random() < config.longBreakChance) {
+    await sleep(randomInt(config.longBreakMinMs, config.longBreakMaxMs));
+  }
+
   await sleep(randomInt(config.preExtractWaitMsMin, config.preExtractWaitMsMax));
 }
+
 
 async function ensureFiles() {
   await fs.mkdir(JSON_DIR, { recursive: true });
@@ -63,14 +72,25 @@ function sanitizeConfig() {
   const cfg = { ...DEFAULT_CONFIG };
 
   cfg.concurrency = Math.min(2, Math.max(1, Number(cfg.concurrency) || DEFAULT_CONFIG.concurrency));
-  cfg.minDelayMs = Math.max(5000, Number(cfg.minDelayMs) || DEFAULT_CONFIG.minDelayMs);
-  cfg.maxDelayMs = Math.max(15000, cfg.minDelayMs, Number(cfg.maxDelayMs) || DEFAULT_CONFIG.maxDelayMs);
-  cfg.navigationTimeoutMs = Math.max(10000, Number(cfg.navigationTimeoutMs) || DEFAULT_CONFIG.navigationTimeoutMs);
+  cfg.minDelayMs = Math.max(8000, Number(cfg.minDelayMs) || DEFAULT_CONFIG.minDelayMs);
+  cfg.maxDelayMs = Math.max(20000, cfg.minDelayMs, Number(cfg.maxDelayMs) || DEFAULT_CONFIG.maxDelayMs);
+  cfg.navigationTimeoutMs = Math.max(30000, Number(cfg.navigationTimeoutMs) || DEFAULT_CONFIG.navigationTimeoutMs);
   cfg.preExtractWaitMsMin = Math.max(1000, Number(cfg.preExtractWaitMsMin) || DEFAULT_CONFIG.preExtractWaitMsMin);
   cfg.preExtractWaitMsMax = Math.max(cfg.preExtractWaitMsMin, Number(cfg.preExtractWaitMsMax) || DEFAULT_CONFIG.preExtractWaitMsMax);
+  cfg.postLoadWaitMsMin = Math.max(500, Number(cfg.postLoadWaitMsMin) || DEFAULT_CONFIG.postLoadWaitMsMin);
+  cfg.postLoadWaitMsMax = Math.max(cfg.postLoadWaitMsMin, Number(cfg.postLoadWaitMsMax) || DEFAULT_CONFIG.postLoadWaitMsMax);
+  cfg.postScrollWaitMsMin = Math.max(500, Number(cfg.postScrollWaitMsMin) || DEFAULT_CONFIG.postScrollWaitMsMin);
+  cfg.postScrollWaitMsMax = Math.max(cfg.postScrollWaitMsMin, Number(cfg.postScrollWaitMsMax) || DEFAULT_CONFIG.postScrollWaitMsMax);
+  cfg.longBreakChance = Math.min(1, Math.max(0, Number(cfg.longBreakChance) || DEFAULT_CONFIG.longBreakChance));
+  cfg.longBreakMinMs = Math.max(1000, Number(cfg.longBreakMinMs) || DEFAULT_CONFIG.longBreakMinMs);
+  cfg.longBreakMaxMs = Math.max(cfg.longBreakMinMs, Number(cfg.longBreakMaxMs) || DEFAULT_CONFIG.longBreakMaxMs);
+  cfg.maxRetries = Math.max(0, Number(cfg.maxRetries) || DEFAULT_CONFIG.maxRetries);
+  cfg.retryDelayMsMin = Math.max(1000, Number(cfg.retryDelayMsMin) || DEFAULT_CONFIG.retryDelayMsMin);
+  cfg.retryDelayMsMax = Math.max(cfg.retryDelayMsMin, Number(cfg.retryDelayMsMax) || DEFAULT_CONFIG.retryDelayMsMax);
 
   return cfg;
 }
+
 
 function normalizeSelectors(selectors) {
   if (!selectors || typeof selectors !== 'object') {
@@ -215,6 +235,32 @@ async function scrapeUrl(browser, url, selectors, config, index, total, pickUser
   }
 }
 
+async function scrapeWithRetry(browser, url, selectors, config, index, total, pickUserAgent) {
+  for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
+    const result = await scrapeUrl(browser, url, selectors, config, index, total, pickUserAgent);
+
+    if (result.status === 'success') {
+      return result;
+    }
+
+    const isLastAttempt = attempt === config.maxRetries;
+    if (!isLastAttempt) {
+      const retryDelay = randomInt(config.retryDelayMsMin, config.retryDelayMsMax);
+      console.log(`[${index + 1}/${total}] retrying in ${retryDelay}ms (attempt ${attempt + 2}/${config.maxRetries + 1})`);
+      await sleep(retryDelay);
+    }
+  }
+
+  return {
+    status: 'error',
+    url,
+    startedAt: new Date().toISOString(),
+    endedAt: new Date().toISOString(),
+    error: 'Retries exhausted'
+  };
+}
+
+
 function runPool(urls, selectors, config) {
   return puppeteer
     .launch({
@@ -231,7 +277,7 @@ function runPool(urls, selectors, config) {
           const index = cursor++;
           const url = urls[index];
 
-          const result = await scrapeUrl(browser, url, selectors, config, index, urls.length, pickUserAgent);
+          const result = await scrapeWithRetry(browser, url, selectors, config, index, urls.length, pickUserAgent);
           results[index] = result;
 
           await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
