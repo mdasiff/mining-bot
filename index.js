@@ -265,73 +265,49 @@ async function scrapeWithRetry(browser, url, selectors, config, index, total, pi
       await sleep(retryDelay);
     }
   }
+
+  return {
+    status: 'error',
+    url,
+    startedAt: new Date().toISOString(),
+    endedAt: new Date().toISOString(),
+    error: 'Retries exhausted'
+  };
 }
 
-async function scrapeWithRetry(browser, url, selectors, config, index, total, pickUserAgent) {
-  for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
-    const result = await scrapeUrl(browser, url, selectors, config, index, total, pickUserAgent);
 
-    if (result.status === 'success') {
-      return result;
-    }
+async function runPool(urls, selectors, config) {
+  const browser = await puppeteer.launch({
+    headless: config.headless,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
 
-    const isLastAttempt = attempt === config.maxRetries;
-    if (!isLastAttempt) {
-      const retryDelay = randomInt(config.retryDelayMsMin, config.retryDelayMsMax);
-      console.log(`[${index + 1}/${total}] retrying in ${retryDelay}ms (attempt ${attempt + 2}/${config.maxRetries + 1})`);
-      await sleep(retryDelay);
+  const results = [];
+  let cursor = 0;
+  const pickUserAgent = createUserAgentPicker();
+
+  const worker = async () => {
+    while (cursor < urls.length) {
+      const index = cursor++;
+      const url = urls[index];
+
+      const result = await scrapeWithRetry(browser, url, selectors, config, index, urls.length, pickUserAgent);
+      results[index] = result;
+
+      await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
     }
+  };
+
+  const workerTasks = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
+
+  try {
+    await Promise.all(workerTasks);
+    return results;
+  } finally {
+    await browser.close();
   }
-
-  return {
-    status: 'error',
-    url,
-    startedAt: new Date().toISOString(),
-    endedAt: new Date().toISOString(),
-    error: 'Retries exhausted'
-  };
 }
 
-  return {
-    status: 'error',
-    url,
-    startedAt: new Date().toISOString(),
-    endedAt: new Date().toISOString(),
-    error: 'Retries exhausted'
-  };
-}
-
-
-function runPool(urls, selectors, config) {
-  return puppeteer
-    .launch({
-      headless: config.headless,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    })
-    .then((browser) => {
-      const results = [];
-      let cursor = 0;
-      const pickUserAgent = createUserAgentPicker();
-
-      const worker = async () => {
-        while (cursor < urls.length) {
-          const index = cursor++;
-          const url = urls[index];
-
-          const result = await scrapeWithRetry(browser, url, selectors, config, index, urls.length, pickUserAgent);
-          results[index] = result;
-
-          await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
-        }
-      };
-
-      const workerTasks = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
-
-      return Promise.all(workerTasks)
-        .then(() => results)
-        .finally(() => browser.close());
-    });
-}
 
 (async () => {
   try {
