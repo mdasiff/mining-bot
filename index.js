@@ -17,9 +17,17 @@ async function ensureFiles() {
   try {
     await fs.access(URL_FILE);
   } catch {
-    const starter = [
-      'https://example.com'
-    ];
+    const starter = {
+      urls: [
+        'https://example.com/property-1'
+      ],
+      selectors: {
+        title: ['h1'],
+        price: ["[class*='price']"],
+        location: ["[class*='location']"]
+      }
+    };
+
     await fs.writeFile(URL_FILE, JSON.stringify(starter, null, 2));
   }
 
@@ -43,58 +51,78 @@ function sanitizeConfig() {
   return cfg;
 }
 
-function normalizeUrlsFromParsedJson(parsed) {
-  if (Array.isArray(parsed)) {
-    return parsed;
-  }
-
-  if (parsed && typeof parsed === 'object') {
-    if (Array.isArray(parsed.urls)) {
-      return parsed.urls;
-    }
-
-    return Object.keys(parsed);
-  }
-
-  return [];
-}
-
 function extractUrlsFromRawText(raw) {
   return raw.match(/https?:\/\/[^\s",}]+/g) || [];
 }
 
-async function readUrls() {
+function normalizeSelectors(selectors) {
+  if (!selectors || typeof selectors !== 'object') {
+    return {};
+  }
+
+  const result = {};
+
+  for (const [fieldName, selectorList] of Object.entries(selectors)) {
+    if (!Array.isArray(selectorList)) {
+      continue;
+    }
+
+    const cleanSelectors = selectorList
+      .map((selector) => (typeof selector === 'string' ? selector.trim() : ''))
+      .filter(Boolean);
+
+    if (cleanSelectors.length > 0) {
+      result[fieldName] = cleanSelectors;
+    }
+  }
+
+  return result;
+}
+
+async function readInputConfig() {
   const raw = await fs.readFile(URL_FILE, 'utf8');
-  let urls = [];
+  let parsed;
 
   try {
-    const parsed = JSON.parse(raw);
-    urls = normalizeUrlsFromParsedJson(parsed);
+    parsed = JSON.parse(raw);
   } catch {
-    // Fallback for non-standard input formats by extracting URLs from text.
-    urls = extractUrlsFromRawText(raw);
+    return {
+      urls: extractUrlsFromRawText(raw),
+      selectors: {}
+    };
   }
 
-  if (!Array.isArray(urls) || urls.length === 0) {
-    throw new Error('url.json must contain URLs, e.g. ["https://site1", "https://site2"]');
-  }
+  const urls = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed.urls)
+      ? parsed.urls
+      : Object.keys(parsed || {});
 
   const cleanUrls = urls
     .map((u) => (typeof u === 'string' ? u.trim() : ''))
     .filter((u) => /^https?:\/\//i.test(u));
 
   if (cleanUrls.length === 0) {
-    throw new Error('url.json has no valid http/https URLs');
+    throw new Error('url.json must contain valid URLs');
   }
 
-  return cleanUrls;
+  const selectors = normalizeSelectors(parsed?.selectors);
+
+  if (Object.keys(selectors).length === 0) {
+    throw new Error('url.json must include selectors object, e.g. {"selectors": {"title": ["h1"]}}');
+  }
+
+  return {
+    urls: cleanUrls,
+    selectors
+  };
 }
 
 async function writeJson(file, data) {
   await fs.writeFile(file, JSON.stringify(data, null, 2));
 }
 
-async function scrapeUrl(browser, url, config, index, total) {
+async function scrapeUrl(browser, url, selectors, config, index, total) {
   const page = await browser.newPage();
   const startedAt = new Date().toISOString();
 
@@ -109,45 +137,51 @@ async function scrapeUrl(browser, url, config, index, total) {
 
     await sleep(randomInt(1200, 3000));
 
-    const data = await page.evaluate(() => {
-      const title = document.querySelector('h1')?.innerText?.trim() || document.title || 'not found';
-      const text = document.body?.innerText || '';
-      const hasPrice = /₹|\$|€|£/.test(text);
+    const extracted = await page.evaluate((selectorMap) => {
+      const pickValue = (selector) => {
+        const node = document.querySelector(selector);
+        if (!node) {
+          return null;
+        }
 
-      const metadata = Array.from(document.querySelectorAll('meta'))
-        .map((meta) => ({
-          name: meta.getAttribute('name') || meta.getAttribute('property') || meta.getAttribute('http-equiv') || null,
-          content: meta.getAttribute('content') || ''
-        }))
-        .filter((meta) => meta.name && meta.content);
+        const contentAttr = node.getAttribute('content');
+        const valueAttr = node.getAttribute('value');
+        const text = node.textContent?.trim();
 
-      const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
-        .map((node) => node.textContent?.trim())
-        .filter(Boolean);
+        return contentAttr || valueAttr || text || null;
+      };
 
-      const links = Array.from(document.querySelectorAll('a[href]'))
-        .map((a) => ({
-          text: a.textContent?.trim() || '',
-          href: a.href
-        }))
-        .filter((link) => link.href)
-        .slice(0, 500);
+      const structured = {};
+
+      for (const [fieldName, selectorList] of Object.entries(selectorMap)) {
+        let value = null;
+        let matchedSelector = null;
+
+        for (const selector of selectorList) {
+          try {
+            value = pickValue(selector);
+            if (value) {
+              matchedSelector = selector;
+              break;
+            }
+          } catch {
+            // Ignore invalid selectors and continue.
+          }
+        }
+
+        structured[fieldName] = {
+          value,
+          matchedSelector
+        };
+      }
 
       return {
-        title,
-        hasPrice,
         extractedAt: new Date().toISOString(),
-        page: {
-          url: window.location.href,
-          documentTitle: document.title,
-          html: document.documentElement.outerHTML,
-          text
-        },
-        metadata,
-        headings,
-        links
+        pageUrl: window.location.href,
+        documentTitle: document.title,
+        fields: structured
       };
-    });
+    }, selectors);
 
     console.log(`[${index + 1}/${total}] ✅ ${url}`);
 
@@ -160,7 +194,7 @@ async function scrapeUrl(browser, url, config, index, total) {
         status: response?.status() ?? null,
         ok: response?.ok() ?? null
       },
-      data
+      data: extracted
     };
   } catch (error) {
     console.log(`[${index + 1}/${total}] ❌ ${url} -> ${error.message}`);
@@ -177,7 +211,7 @@ async function scrapeUrl(browser, url, config, index, total) {
   }
 }
 
-async function runPool(urls, config) {
+async function runPool(urls, selectors, config) {
   const browser = await puppeteer.launch({
     headless: config.headless,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
@@ -191,12 +225,13 @@ async function runPool(urls, config) {
       const index = cursor++;
       const url = urls[index];
 
-      const result = await scrapeUrl(browser, url, config, index, urls.length);
+      const result = await scrapeUrl(browser, url, selectors, config, index, urls.length);
       results[index] = result;
 
       await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
     }
   }
+}
 
   const workerTasks = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
 
@@ -210,13 +245,13 @@ async function runPool(urls, config) {
   try {
     await ensureFiles();
 
-    const urls = await readUrls();
+    const { urls, selectors } = await readInputConfig();
     const config = sanitizeConfig();
 
     console.log(`Starting scrape for ${urls.length} URLs in one browser instance...`);
-    console.log(`Config: ${JSON.stringify(config)}`);
+    console.log(`Selectors configured: ${Object.keys(selectors).length}`);
 
-    const results = await runPool(urls, config);
+    const results = await runPool(urls, selectors, config);
     const output = results.filter((entry) => entry.status === 'success');
     const logs = results.map((entry) => ({
       url: entry.url,
