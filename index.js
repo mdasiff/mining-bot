@@ -250,8 +250,12 @@ async function configurePageSession(page, sessionState) {
 
   await page.setUserAgent(sessionState.userAgent);
   await page.setViewport(viewport);
-  await page.setRequestInterception(true);
   await page.emulateTimezone(profile.timezone);
+
+  if (!sessionState.interceptionEnabled) {
+    await page.setRequestInterception(true);
+    sessionState.interceptionEnabled = true;
+  }
 
   await page.evaluateOnNewDocument((runtimeProfile) => {
     Object.defineProperty(navigator, 'language', {
@@ -269,20 +273,29 @@ async function configurePageSession(page, sessionState) {
 
   sessionState.locale = profile.locale;
 
-  page.removeAllListeners('request');
-  page.on('request', (request) => {
-    if (shouldBlockRequest(request.resourceType())) {
-      request.abort();
-      return;
-    }
+  if (!sessionState.requestHandlerAttached) {
+    page.on('request', (request) => {
+      if (shouldBlockRequest(request.resourceType())) {
+        request.abort();
+        return;
+      }
 
-    request.continue();
-  });
+      request.continue();
+    });
+
+    sessionState.requestHandlerAttached = true;
+  }
 }
 
 
-async function setDynamicHeaders(page, homepage, previousUrl, locale) {
+async function setDynamicHeaders(page, homepage, previousUrl, locale, sessionState) {
   const referer = chooseReferer(homepage, previousUrl);
+  const refererKey = referer || '__none__';
+
+  if (sessionState.lastHeaderReferer === refererKey && sessionState.lastHeaderLocale === locale) {
+    return;
+  }
+
   const headers = {
     'Accept-Language': `${locale},en;q=0.9`,
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
@@ -292,8 +305,17 @@ async function setDynamicHeaders(page, homepage, previousUrl, locale) {
     headers.Referer = referer;
   }
 
-  await page.setExtraHTTPHeaders(headers);
+  await sleep(randomInt(100, 300));
+
+  try {
+    await page.setExtraHTTPHeaders(headers);
+    sessionState.lastHeaderReferer = refererKey;
+    sessionState.lastHeaderLocale = locale;
+  } catch (error) {
+    console.warn(`Header update warning: ${error.message}`);
+  }
 }
+
 
 async function warmupBrowse(page, homepage, config) {
   await page.goto(homepage, {
@@ -336,9 +358,9 @@ async function warmupBrowse(page, homepage, config) {
 }
 
 
-async function navigateWithFlow(page, url, config, previousUrl, sessionLocale) {
+async function navigateWithFlow(page, url, config, previousUrl, sessionLocale, sessionState) {
   const homepage = getHomepage(url);
-  await setDynamicHeaders(page, homepage, previousUrl, sessionLocale);
+  await setDynamicHeaders(page, homepage, previousUrl, sessionLocale, sessionState);
 
   const flowMode = randomInt(1, 3);
 
@@ -380,7 +402,7 @@ async function scrapeUrl(sessionState, url, selectors, config, index, total) {
   const startedAt = new Date().toISOString();
 
   try {
-    const response = await navigateWithFlow(sessionState.page, url, config, sessionState.previousUrl, sessionState.locale || "en-US");
+    const response = await navigateWithFlow(sessionState.page, url, config, sessionState.previousUrl, sessionState.locale || "en-US", sessionState);
 
     const pageText = await sessionState.page.evaluate(() => document.body?.innerText || '');
     if (detectBlockPageText(pageText)) {
@@ -458,9 +480,32 @@ async function scrapeUrl(sessionState, url, selectors, config, index, total) {
   }
 }
 
+async function recreateSessionPage(sessionState) {
+  try {
+    await sessionState.page.close();
+  } catch {
+    // Ignore close failure.
+  }
+
+  const page = await sessionState.context.newPage();
+  sessionState.page = page;
+  sessionState.interceptionEnabled = false;
+  sessionState.requestHandlerAttached = false;
+  sessionState.lastHeaderReferer = null;
+  sessionState.lastHeaderLocale = null;
+
+  await configurePageSession(page, sessionState);
+}
+
+
 async function scrapeWithRetry(sessionState, url, selectors, config, index, total, runtimeState) {
   for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
     const result = await scrapeUrl(sessionState, url, selectors, config, index, total);
+
+    if (result.status === "error" && /Network\.setExtraHTTPHeaders timed out/i.test(result.error || "")) {
+      console.warn(`[${index + 1}/${total}] recovering page session after header timeout...`);
+      await recreateSessionPage(sessionState);
+    }
 
     if (result.status === 'success') {
       runtimeState.delayMultiplier = Math.max(1, runtimeState.delayMultiplier - 0.2);
@@ -529,6 +574,7 @@ async function saveCookies(context) {
 async function runPool(urls, selectors, config) {
   const browser = await puppeteer.launch({
     headless: config.headless,
+    protocolTimeout: 120000,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
 
@@ -543,8 +589,13 @@ async function runPool(urls, selectors, config) {
         const page = await context.newPage();
         const sessionState = {
           page,
+          context,
           userAgent: pickUserAgent(),
-          previousUrl: null
+          previousUrl: null,
+          interceptionEnabled: false,
+          requestHandlerAttached: false,
+          lastHeaderReferer: null,
+          lastHeaderLocale: null
         };
 
         await configurePageSession(page, sessionState);
