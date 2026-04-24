@@ -19,16 +19,13 @@ async function ensureFiles() {
   } catch {
     const starter = {
       urls: [
-        {
-          url: 'https://example.com/property-1',
-          selectors: {
-            field_name_1: ['h1'],
-            field_name_2: ["[data-qa='value']", "[class*='value']"]
-          }
-        }
+        'https://www.example.com/page1',
+        'https://www.example.com/page2'
       ],
       selectors: {
-        fallback_field: ['title']
+        title: 'h1.title',
+        description: 'p.description',
+        price: '.price'
       }
     };
 
@@ -55,10 +52,6 @@ function sanitizeConfig() {
   return cfg;
 }
 
-function extractUrlsFromRawText(raw) {
-  return raw.match(/https?:\/\/[^\s",}]+/g) || [];
-}
-
 function normalizeSelectors(selectors) {
   if (!selectors || typeof selectors !== 'object') {
     return {};
@@ -81,70 +74,40 @@ function normalizeSelectors(selectors) {
   return result;
 }
 
-function normalizeTargets(parsed) {
-  const globalSelectors = normalizeSelectors(parsed?.selectors);
-  const sourceUrls = Array.isArray(parsed?.urls) ? parsed.urls : Array.isArray(parsed) ? parsed : [];
-
-  const targets = sourceUrls
-    .map((entry) => {
-      if (typeof entry === 'string') {
-        return {
-          url: entry.trim(),
-          selectors: globalSelectors
-        };
-      }
-
-      if (!entry || typeof entry !== 'object') {
-        return null;
-      }
-
-      const url = typeof entry.url === 'string' ? entry.url.trim() : '';
-      const localSelectors = normalizeSelectors(entry.selectors);
-
-      return {
-        url,
-        selectors: Object.keys(localSelectors).length > 0 ? localSelectors : globalSelectors
-      };
-    })
-    .filter((target) => target && /^https?:\/\//i.test(target.url));
-
-  return targets;
-}
-
 async function readInputConfig() {
   const raw = await fs.readFile(URL_FILE, 'utf8');
+  const parsed = JSON.parse(raw);
 
-  try {
-    const parsed = JSON.parse(raw);
-    const targets = normalizeTargets(parsed);
-
-    if (targets.length === 0) {
-      throw new Error('url.json must contain urls array with valid URLs');
-    }
-
-    const missingSelectors = targets.filter((target) => Object.keys(target.selectors).length === 0).length;
-    if (missingSelectors > 0) {
-      throw new Error('Every URL must have selectors (global selectors or per-url selectors).');
-    }
-
-    return { targets };
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      const urls = extractUrlsFromRawText(raw).map((url) => ({ url, selectors: {} }));
-      if (urls.length > 0) {
-        throw new Error('Invalid JSON format. Please provide selectors with valid JSON.');
-      }
-    }
-
-    throw error;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('url.json must be an object: { "urls": [...], "selectors": {...} }');
   }
+
+  const urls = Array.isArray(parsed.urls) ? parsed.urls : [];
+  const cleanUrls = urls
+    .map((url) => (typeof url === 'string' ? url.trim() : ''))
+    .filter((url) => /^https?:\/\//i.test(url));
+
+  if (cleanUrls.length === 0) {
+    throw new Error('url.json must include a non-empty urls array with valid http/https URLs');
+  }
+
+  const selectors = normalizeSelectors(parsed.selectors);
+
+  if (Object.keys(selectors).length === 0) {
+    throw new Error('url.json must include selectors object with field selectors');
+  }
+
+  return {
+    urls: cleanUrls,
+    selectors
+  };
 }
 
 async function writeJson(file, data) {
   await fs.writeFile(file, JSON.stringify(data, null, 2));
 }
 
-async function scrapeUrl(browser, target, config, index, total) {
+async function scrapeUrl(browser, url, selectors, config, index, total) {
   const page = await browser.newPage();
   const startedAt = new Date().toISOString();
 
@@ -152,7 +115,7 @@ async function scrapeUrl(browser, target, config, index, total) {
     await page.setUserAgent(USER_AGENTS[index % USER_AGENTS.length]);
     await page.setViewport({ width: 1366, height: 768 });
 
-    const response = await page.goto(target.url, {
+    const response = await page.goto(url, {
       waitUntil: 'domcontentloaded',
       timeout: config.navigationTimeoutMs
     });
@@ -173,7 +136,7 @@ async function scrapeUrl(browser, target, config, index, total) {
         return contentAttr || valueAttr || text || null;
       };
 
-      const structured = {};
+      const fields = {};
 
       for (const [fieldName, selectorList] of Object.entries(selectorMap)) {
         let value = null;
@@ -187,11 +150,11 @@ async function scrapeUrl(browser, target, config, index, total) {
               break;
             }
           } catch {
-            // Ignore invalid selectors and continue.
+            // Ignore invalid selector and continue.
           }
         }
 
-        structured[fieldName] = {
+        fields[fieldName] = {
           value,
           matchedSelector
         };
@@ -200,16 +163,15 @@ async function scrapeUrl(browser, target, config, index, total) {
       return {
         extractedAt: new Date().toISOString(),
         pageUrl: window.location.href,
-        documentTitle: document.title,
-        fields: structured
+        fields
       };
-    }, target.selectors);
+    }, selectors);
 
-    console.log(`[${index + 1}/${total}] ✅ ${target.url}`);
+    console.log(`[${index + 1}/${total}] ✅ ${url}`);
 
     return {
       status: 'success',
-      url: target.url,
+      url,
       startedAt,
       endedAt: new Date().toISOString(),
       response: {
@@ -219,11 +181,11 @@ async function scrapeUrl(browser, target, config, index, total) {
       data: extracted
     };
   } catch (error) {
-    console.log(`[${index + 1}/${total}] ❌ ${target.url} -> ${error.message}`);
+    console.log(`[${index + 1}/${total}] ❌ ${url} -> ${error.message}`);
 
     return {
       status: 'error',
-      url: target.url,
+      url,
       startedAt,
       endedAt: new Date().toISOString(),
       error: error.message
@@ -233,7 +195,7 @@ async function scrapeUrl(browser, target, config, index, total) {
   }
 }
 
-function runPool(targets, config) {
+function runPool(urls, selectors, config) {
   return puppeteer
     .launch({
       headless: config.headless,
@@ -244,18 +206,18 @@ function runPool(targets, config) {
       let cursor = 0;
 
       const worker = async () => {
-        while (cursor < targets.length) {
+        while (cursor < urls.length) {
           const index = cursor++;
-          const target = targets[index];
+          const url = urls[index];
 
-          const result = await scrapeUrl(browser, target, config, index, targets.length);
+          const result = await scrapeUrl(browser, url, selectors, config, index, urls.length);
           results[index] = result;
 
           await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
         }
       };
 
-      const workerTasks = Array.from({ length: Math.min(config.concurrency, targets.length) }, () => worker());
+      const workerTasks = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
 
       return Promise.all(workerTasks)
         .then(() => results)
@@ -267,12 +229,12 @@ function runPool(targets, config) {
   try {
     await ensureFiles();
 
-    const { targets } = await readInputConfig();
+    const { urls, selectors } = await readInputConfig();
     const config = sanitizeConfig();
 
-    console.log(`Starting scrape for ${targets.length} URLs in one browser instance...`);
+    console.log(`Starting scrape for ${urls.length} URLs in one browser instance...`);
 
-    const results = await runPool(targets, config);
+    const results = await runPool(urls, selectors, config);
     const output = results.filter((entry) => entry.status === 'success');
     const logs = results.map((entry) => ({
       url: entry.url,
