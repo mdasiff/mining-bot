@@ -17,19 +17,7 @@ async function ensureFiles() {
   try {
     await fs.access(URL_FILE);
   } catch {
-    const starter = {
-      urls: [
-        'https://www.example.com/page1',
-        'https://www.example.com/page2'
-      ],
-      selectors: {
-        title: 'h1.title',
-        description: 'p.description',
-        price: '.price'
-      }
-    };
-
-    await fs.writeFile(URL_FILE, JSON.stringify(starter, null, 2));
+    throw new Error(`Missing input file: ${URL_FILE}. Please create it with { "urls": [...], "selectors": {...} }`);
   }
 
   for (const file of [OUTPUT_FILE, LOG_FILE]) {
