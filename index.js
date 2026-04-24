@@ -265,6 +265,32 @@ async function scrapeWithRetry(browser, url, selectors, config, index, total, pi
       await sleep(retryDelay);
     }
   }
+}
+
+async function scrapeWithRetry(browser, url, selectors, config, index, total, pickUserAgent) {
+  for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
+    const result = await scrapeUrl(browser, url, selectors, config, index, total, pickUserAgent);
+
+    if (result.status === 'success') {
+      return result;
+    }
+
+    const isLastAttempt = attempt === config.maxRetries;
+    if (!isLastAttempt) {
+      const retryDelay = randomInt(config.retryDelayMsMin, config.retryDelayMsMax);
+      console.log(`[${index + 1}/${total}] retrying in ${retryDelay}ms (attempt ${attempt + 2}/${config.maxRetries + 1})`);
+      await sleep(retryDelay);
+    }
+  }
+
+  return {
+    status: 'error',
+    url,
+    startedAt: new Date().toISOString(),
+    endedAt: new Date().toISOString(),
+    error: 'Retries exhausted'
+  };
+}
 
   return {
     status: 'error',
