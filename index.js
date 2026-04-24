@@ -231,6 +231,7 @@ async function runPool(urls, selectors, config) {
       await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
     }
   }
+}
 
   const workerTasks = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
 
