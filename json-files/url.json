@@ -1,0 +1,12 @@
+{
+  "urls": [
+    "https://www.example.com/page1",
+    "https://www.example.com/page2",
+    "https://www.example.com/page3"
+  ],
+  "selectors": {
+    "title": "h1.title",
+    "description": "p.description",
+    "price": ".price"
+  }
+}
