@@ -7,6 +7,7 @@ const JSON_DIR = path.join(__dirname, 'json-files');
 const URL_FILE = path.join(JSON_DIR, 'url.json');
 const OUTPUT_FILE = path.join(JSON_DIR, 'output.json');
 const LOG_FILE = path.join(JSON_DIR, 'log.json');
+const COOKIE_FILE = path.join(JSON_DIR, 'cookies.json');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -38,29 +39,34 @@ function getViewportForUserAgent(userAgent) {
   return { width: 1366, height: 768, isMobile: false };
 }
 
-function shouldBlockRequest(url, resourceType) {
-  if (resourceType === 'image' || resourceType === 'font') {
-    return true;
-  }
-
-  return /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|segment|mixpanel|clarity|pixel/i.test(url);
+function shouldBlockRequest(resourceType) {
+  return resourceType === 'image' || resourceType === 'font';
 }
 
 async function simulateHumanBehavior(page, config) {
   await sleep(randomInt(config.postLoadWaitMsMin, config.postLoadWaitMsMax));
 
+  // Sometimes user just reads.
+  if (Math.random() < 0.35) {
+    await sleep(randomInt(5000, 15000));
+    return;
+  }
+
   const totalHeight = await page.evaluate(() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
-  const steps = randomInt(4, 8);
+  const steps = randomInt(3, 7);
 
   for (let i = 1; i <= steps; i += 1) {
     const nextY = Math.min(totalHeight, Math.floor((totalHeight / steps) * i));
     await page.mouse.move(randomInt(120, 1200), randomInt(120, 700), { steps: randomInt(8, 20) });
     await page.evaluate((y) => window.scrollTo({ top: y, behavior: 'smooth' }), nextY);
-    await sleep(randomInt(500, 1400));
+    await sleep(randomInt(400, 1200));
   }
 
   await sleep(randomInt(config.postScrollWaitMsMin, config.postScrollWaitMsMax));
-  await page.mouse.click(randomInt(60, 1100), randomInt(100, 650), { delay: randomInt(50, 180) });
+
+  if (Math.random() < 0.7) {
+    await page.mouse.click(randomInt(60, 1100), randomInt(100, 650), { delay: randomInt(50, 180) });
+  }
 
   if (Math.random() < config.longBreakChance) {
     await sleep(randomInt(config.longBreakMinMs, config.longBreakMaxMs));
@@ -90,7 +96,7 @@ async function ensureFiles() {
     throw new Error(`Missing input file: ${URL_FILE}. Please create it with { "urls": [...], "selectors": {...} }`);
   }
 
-  for (const file of [OUTPUT_FILE, LOG_FILE]) {
+  for (const file of [OUTPUT_FILE, LOG_FILE, COOKIE_FILE]) {
     try {
       await fs.access(file);
     } catch {
@@ -182,21 +188,35 @@ async function writeJson(file, data) {
   await fs.writeFile(file, JSON.stringify(data, null, 2));
 }
 
-async function configurePageSession(page, userAgent, referer) {
-  const viewport = getViewportForUserAgent(userAgent);
+function getHomepage(url) {
+  const parsed = new URL(url);
+  return `${parsed.protocol}//${parsed.host}/`;
+}
 
-  await page.setUserAgent(userAgent);
+function chooseReferer(homepage, previousUrl) {
+  const choice = randomInt(1, 3);
+
+  if (choice === 1) {
+    return homepage;
+  }
+
+  if (choice === 2 && previousUrl) {
+    return previousUrl;
+  }
+
+  return undefined;
+}
+
+async function configurePageSession(page, sessionState) {
+  const viewport = getViewportForUserAgent(sessionState.userAgent);
+
+  await page.setUserAgent(sessionState.userAgent);
   await page.setViewport(viewport);
-  await page.setExtraHTTPHeaders({
-    'Accept-Language': 'en-US,en;q=0.9',
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    Referer: referer
-  });
-
   await page.setRequestInterception(true);
+
   page.removeAllListeners('request');
   page.on('request', (request) => {
-    if (shouldBlockRequest(request.url(), request.resourceType())) {
+    if (shouldBlockRequest(request.resourceType())) {
       request.abort();
       return;
     }
@@ -205,22 +225,61 @@ async function configurePageSession(page, userAgent, referer) {
   });
 }
 
-function getHomepage(url) {
-  const parsed = new URL(url);
-  return `${parsed.protocol}//${parsed.host}/`;
+async function setDynamicHeaders(page, homepage, previousUrl) {
+  const referer = chooseReferer(homepage, previousUrl);
+  const headers = {
+    'Accept-Language': 'en-US,en;q=0.9',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+  };
+
+  if (referer) {
+    headers.Referer = referer;
+  }
+
+  await page.setExtraHTTPHeaders(headers);
 }
 
-async function navigateWithFlow(page, url, config) {
-  await sleep(randomInt(config.preNavigationDelayMsMin, config.preNavigationDelayMsMax));
+async function warmupBrowse(page, homepage, config) {
+  await page.goto(homepage, {
+    waitUntil: 'domcontentloaded',
+    timeout: config.navigationTimeoutMs
+  });
 
-  if (Math.random() < 0.45) {
-    const homepage = getHomepage(url);
-    await page.goto(homepage, {
-      waitUntil: 'domcontentloaded',
-      timeout: config.navigationTimeoutMs
+  await sleep(randomInt(1200, 3500));
+
+  if (Math.random() < 0.5) {
+    const randomLink = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a[href]'))
+        .map((a) => a.href)
+        .filter((href) => href && href.startsWith(window.location.origin));
+
+      if (links.length === 0) {
+        return null;
+      }
+
+      return links[Math.floor(Math.random() * links.length)];
     });
 
-    await sleep(randomInt(1200, 3200));
+    if (randomLink) {
+      await page.goto(randomLink, {
+        waitUntil: 'domcontentloaded',
+        timeout: config.navigationTimeoutMs
+      });
+
+      await sleep(randomInt(1000, 2500));
+    }
+  }
+}
+
+async function navigateWithFlow(page, url, config, previousUrl) {
+  await sleep(randomInt(config.preNavigationDelayMsMin, config.preNavigationDelayMsMax));
+
+  const homepage = getHomepage(url);
+  await setDynamicHeaders(page, homepage, previousUrl);
+
+  const warmupProbability = 0.2 + Math.random() * 0.4;
+  if (Math.random() < warmupProbability) {
+    await warmupBrowse(page, homepage, config);
   }
 
   return page.goto(url, {
@@ -229,24 +288,20 @@ async function navigateWithFlow(page, url, config) {
   });
 }
 
-async function scrapeUrl(page, url, selectors, config, index, total, pickUserAgent) {
+async function scrapeUrl(sessionState, url, selectors, config, index, total) {
   const startedAt = new Date().toISOString();
 
   try {
-    const userAgent = pickUserAgent();
-    const homepage = getHomepage(url);
+    const response = await navigateWithFlow(sessionState.page, url, config, sessionState.previousUrl);
 
-    await configurePageSession(page, userAgent, homepage);
-    const response = await navigateWithFlow(page, url, config);
-
-    const pageText = await page.evaluate(() => document.body?.innerText || '');
+    const pageText = await sessionState.page.evaluate(() => document.body?.innerText || '');
     if (detectBlockPageText(pageText)) {
       throw new Error('Block page detected by content scan');
     }
 
-    await simulateHumanBehavior(page, config);
+    await simulateHumanBehavior(sessionState.page, config);
 
-    const extracted = await page.evaluate((selectorMap) => {
+    const extracted = await sessionState.page.evaluate((selectorMap) => {
       const pickValue = (selector) => {
         const node = document.querySelector(selector);
         if (!node) {
@@ -288,6 +343,7 @@ async function scrapeUrl(page, url, selectors, config, index, total, pickUserAge
       };
     }, selectors);
 
+    sessionState.previousUrl = url;
     console.log(`[${index + 1}/${total}] ✅ ${url}`);
 
     return {
@@ -314,17 +370,20 @@ async function scrapeUrl(page, url, selectors, config, index, total, pickUserAge
   }
 }
 
-async function scrapeWithRetry(page, url, selectors, config, index, total, pickUserAgent) {
+async function scrapeWithRetry(sessionState, url, selectors, config, index, total, runtimeState) {
   for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
-    const result = await scrapeUrl(page, url, selectors, config, index, total, pickUserAgent);
+    const result = await scrapeUrl(sessionState, url, selectors, config, index, total);
 
     if (result.status === 'success') {
+      runtimeState.delayMultiplier = Math.max(1, runtimeState.delayMultiplier - 0.2);
       return result;
     }
 
+    runtimeState.delayMultiplier = Math.min(3, runtimeState.delayMultiplier + 0.5);
+
     const isLastAttempt = attempt === config.maxRetries;
     if (!isLastAttempt) {
-      const retryDelay = randomInt(config.retryDelayMsMin, config.retryDelayMsMax);
+      const retryDelay = Math.floor(randomInt(config.retryDelayMsMin, config.retryDelayMsMax) * runtimeState.delayMultiplier);
       console.log(`[${index + 1}/${total}] retrying in ${retryDelay}ms (attempt ${attempt + 2}/${config.maxRetries + 1})`);
       await sleep(retryDelay);
     }
@@ -339,6 +398,20 @@ async function scrapeWithRetry(page, url, selectors, config, index, total, pickU
   };
 }
 
+async function loadCookies(context) {
+  const raw = await fs.readFile(COOKIE_FILE, 'utf8');
+  const cookies = JSON.parse(raw);
+
+  if (Array.isArray(cookies) && cookies.length > 0) {
+    await context.setCookie(...cookies);
+  }
+}
+
+async function saveCookies(context) {
+  const cookies = await context.cookies();
+  await writeJson(COOKIE_FILE, cookies);
+}
+
 async function runPool(urls, selectors, config) {
   const browser = await puppeteer.launch({
     headless: config.headless,
@@ -348,30 +421,45 @@ async function runPool(urls, selectors, config) {
   const context = await browser.createBrowserContext();
 
   try {
-    const pagePool = await Promise.all(
-      Array.from({ length: Math.min(config.concurrency, urls.length) }, () => context.newPage())
+    await loadCookies(context);
+
+    const pickUserAgent = createUserAgentPicker();
+    const sessionStates = await Promise.all(
+      Array.from({ length: Math.min(config.concurrency, urls.length) }, async () => {
+        const page = await context.newPage();
+        const sessionState = {
+          page,
+          userAgent: pickUserAgent(),
+          previousUrl: null
+        };
+
+        await configurePageSession(page, sessionState);
+        return sessionState;
+      })
     );
 
+    const runtimeState = { delayMultiplier: 1 };
     const results = [];
     let cursor = 0;
-    const pickUserAgent = createUserAgentPicker();
 
-    const worker = async (page) => {
+    const worker = async (sessionState) => {
       while (cursor < urls.length) {
         const index = cursor++;
         const url = urls[index];
 
-        const result = await scrapeWithRetry(page, url, selectors, config, index, urls.length, pickUserAgent);
+        const result = await scrapeWithRetry(sessionState, url, selectors, config, index, urls.length, runtimeState);
         results[index] = result;
 
-        await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
+        const baseDelay = randomInt(config.minDelayMs, config.maxDelayMs);
+        await sleep(Math.floor(baseDelay * runtimeState.delayMultiplier));
       }
     };
 
-    await Promise.all(pagePool.map((page) => worker(page)));
+    await Promise.all(sessionStates.map((sessionState) => worker(sessionState)));
+    await saveCookies(context);
 
-    for (const page of pagePool) {
-      await page.close();
+    for (const sessionState of sessionStates) {
+      await sessionState.page.close();
     }
 
     return results;
