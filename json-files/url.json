@@ -1,8 +1,20 @@
 {
   "urls": [
-    "https://example1.com/property-1",
-    "https://example2.com/property-2",
-    "https://example3.com/property-3"
+    {
+      "url": "https://example1.com/property-1"
+    },
+    {
+      "url": "https://example2.com/property-2",
+      "selectors": {
+        "title": [
+          "h1.property-title",
+          "meta[property='og:title']"
+        ]
+      }
+    },
+    {
+      "url": "https://example3.com/property-3"
+    }
   ],
   "selectors": {
     "title": [
