@@ -43,6 +43,42 @@ function shouldBlockRequest(resourceType) {
   return resourceType === 'image' || resourceType === 'font';
 }
 
+function inferProfileFromUserAgent(userAgent) {
+  const isMobile = isMobileUserAgent(userAgent);
+  const isMac = /Macintosh|iPhone/i.test(userAgent);
+  const isWindows = /Windows/i.test(userAgent);
+
+  if (isMobile) {
+    return {
+      timezone: 'America/New_York',
+      locale: 'en-US',
+      platform: /iPhone/i.test(userAgent) ? 'iPhone' : 'Linux armv8l'
+    };
+  }
+
+  if (isMac) {
+    return {
+      timezone: 'America/Los_Angeles',
+      locale: 'en-US',
+      platform: 'MacIntel'
+    };
+  }
+
+  if (isWindows) {
+    return {
+      timezone: 'America/Chicago',
+      locale: 'en-US',
+      platform: 'Win32'
+    };
+  }
+
+  return {
+    timezone: 'America/New_York',
+    locale: 'en-US',
+    platform: 'Linux x86_64'
+  };
+}
+
 async function simulateHumanBehavior(page, config) {
   await sleep(randomInt(config.postLoadWaitMsMin, config.postLoadWaitMsMax));
 
@@ -126,6 +162,7 @@ function sanitizeConfig() {
   cfg.retryDelayMsMax = Math.max(cfg.retryDelayMsMin, Number(cfg.retryDelayMsMax) || DEFAULT_CONFIG.retryDelayMsMax);
   cfg.preNavigationDelayMsMin = 2000;
   cfg.preNavigationDelayMsMax = 5000;
+  cfg.sessionResetChance = 0.15;
 
   return cfg;
 }
@@ -209,10 +246,28 @@ function chooseReferer(homepage, previousUrl) {
 
 async function configurePageSession(page, sessionState) {
   const viewport = getViewportForUserAgent(sessionState.userAgent);
+  const profile = inferProfileFromUserAgent(sessionState.userAgent);
 
   await page.setUserAgent(sessionState.userAgent);
   await page.setViewport(viewport);
   await page.setRequestInterception(true);
+  await page.emulateTimezone(profile.timezone);
+
+  await page.evaluateOnNewDocument((runtimeProfile) => {
+    Object.defineProperty(navigator, 'language', {
+      get: () => runtimeProfile.locale
+    });
+
+    Object.defineProperty(navigator, 'languages', {
+      get: () => [runtimeProfile.locale, 'en']
+    });
+
+    Object.defineProperty(navigator, 'platform', {
+      get: () => runtimeProfile.platform
+    });
+  }, profile);
+
+  sessionState.locale = profile.locale;
 
   page.removeAllListeners('request');
   page.on('request', (request) => {
@@ -225,10 +280,11 @@ async function configurePageSession(page, sessionState) {
   });
 }
 
-async function setDynamicHeaders(page, homepage, previousUrl) {
+
+async function setDynamicHeaders(page, homepage, previousUrl, locale) {
   const referer = chooseReferer(homepage, previousUrl);
   const headers = {
-    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Language': `${locale},en;q=0.9`,
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
   };
 
@@ -247,7 +303,9 @@ async function warmupBrowse(page, homepage, config) {
 
   await sleep(randomInt(1200, 3500));
 
-  if (Math.random() < 0.5) {
+  const explorationSteps = randomInt(1, 2);
+
+  for (let step = 0; step < explorationSteps; step += 1) {
     const randomLink = await page.evaluate(() => {
       const links = Array.from(document.querySelectorAll('a[href]'))
         .map((a) => a.href)
@@ -260,27 +318,56 @@ async function warmupBrowse(page, homepage, config) {
       return links[Math.floor(Math.random() * links.length)];
     });
 
-    if (randomLink) {
-      await page.goto(randomLink, {
-        waitUntil: 'domcontentloaded',
-        timeout: config.navigationTimeoutMs
-      });
+    if (!randomLink) {
+      break;
+    }
 
-      await sleep(randomInt(1000, 2500));
+    await page.goto(randomLink, {
+      waitUntil: 'domcontentloaded',
+      timeout: config.navigationTimeoutMs
+    });
+    await sleep(randomInt(900, 2300));
+
+    if (Math.random() < 0.45) {
+      await page.goBack({ waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs }).catch(() => null);
+      await sleep(randomInt(600, 1800));
     }
   }
 }
 
-async function navigateWithFlow(page, url, config, previousUrl) {
-  await sleep(randomInt(config.preNavigationDelayMsMin, config.preNavigationDelayMsMax));
 
+async function navigateWithFlow(page, url, config, previousUrl, sessionLocale) {
   const homepage = getHomepage(url);
-  await setDynamicHeaders(page, homepage, previousUrl);
+  await setDynamicHeaders(page, homepage, previousUrl, sessionLocale);
 
-  const warmupProbability = 0.2 + Math.random() * 0.4;
-  if (Math.random() < warmupProbability) {
+  const flowMode = randomInt(1, 3);
+
+  // Mode 1: direct with short idle
+  if (flowMode === 1) {
+    await sleep(randomInt(config.preNavigationDelayMsMin, config.preNavigationDelayMsMax));
+    return page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: config.navigationTimeoutMs
+    });
+  }
+
+  // Mode 2: idle then warm-up then target
+  if (flowMode === 2) {
+    await sleep(randomInt(5000, 15000));
+    if (Math.random() < 0.2 + Math.random() * 0.4) {
+      await warmupBrowse(page, homepage, config);
+    }
+    return page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: config.navigationTimeoutMs
+    });
+  }
+
+  // Mode 3: warm-up first then idle then target
+  if (Math.random() < 0.2 + Math.random() * 0.4) {
     await warmupBrowse(page, homepage, config);
   }
+  await sleep(randomInt(config.preNavigationDelayMsMin, config.preNavigationDelayMsMax));
 
   return page.goto(url, {
     waitUntil: 'domcontentloaded',
@@ -288,11 +375,12 @@ async function navigateWithFlow(page, url, config, previousUrl) {
   });
 }
 
+
 async function scrapeUrl(sessionState, url, selectors, config, index, total) {
   const startedAt = new Date().toISOString();
 
   try {
-    const response = await navigateWithFlow(sessionState.page, url, config, sessionState.previousUrl);
+    const response = await navigateWithFlow(sessionState.page, url, config, sessionState.previousUrl, sessionState.locale || "en-US");
 
     const pageText = await sessionState.page.evaluate(() => document.body?.innerText || '');
     if (detectBlockPageText(pageText)) {
@@ -398,14 +486,40 @@ async function scrapeWithRetry(sessionState, url, selectors, config, index, tota
   };
 }
 
-async function loadCookies(context) {
+async function loadCookies(context, urls, config) {
   const raw = await fs.readFile(COOKIE_FILE, 'utf8');
   const cookies = JSON.parse(raw);
 
-  if (Array.isArray(cookies) && cookies.length > 0) {
-    await context.setCookie(...cookies);
+  if (!Array.isArray(cookies) || cookies.length === 0) {
+    return;
+  }
+
+  if (Math.random() < config.sessionResetChance) {
+    console.log('Session aging triggered: starting fresh (skipping stored cookies).');
+    return;
+  }
+
+  const domains = new Set(
+    urls.map((url) => {
+      const host = new URL(url).hostname;
+      return host.startsWith('www.') ? host.slice(4) : host;
+    })
+  );
+
+  const filtered = cookies.filter((cookie) => {
+    const cookieDomain = (cookie.domain || '').replace(/^\./, '');
+    if (!cookieDomain) {
+      return false;
+    }
+
+    return [...domains].some((domain) => domain === cookieDomain || domain.endsWith(`.${cookieDomain}`) || cookieDomain.endsWith(`.${domain}`));
+  });
+
+  if (filtered.length > 0) {
+    await context.setCookie(...filtered);
   }
 }
+
 
 async function saveCookies(context) {
   const cookies = await context.cookies();
@@ -421,7 +535,7 @@ async function runPool(urls, selectors, config) {
   const context = await browser.createBrowserContext();
 
   try {
-    await loadCookies(context);
+    await loadCookies(context, urls, config);
 
     const pickUserAgent = createUserAgentPicker();
     const sessionStates = await Promise.all(
