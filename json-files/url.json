@@ -1,0 +1,36 @@
+{
+  "urls": [
+    {
+      "url": "https://example1.com/property-1"
+    },
+    {
+      "url": "https://example2.com/property-2",
+      "selectors": {
+        "title": [
+          "h1.property-title",
+          "meta[property='og:title']"
+        ]
+      }
+    },
+    {
+      "url": "https://example3.com/property-3"
+    }
+  ],
+  "selectors": {
+    "title": [
+      "h1",
+      "[data-label='title']",
+      "meta[property='og:title']"
+    ],
+    "price": [
+      "[data-label='PRICE']",
+      "[class*='price']",
+      "[itemprop='price']"
+    ],
+    "location": [
+      "[data-label='LOCATION']",
+      "[class*='loc']",
+      "[itemprop='address']"
+    ]
+  }
+}
