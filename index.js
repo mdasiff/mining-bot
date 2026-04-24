@@ -26,6 +26,26 @@ function createUserAgentPicker() {
   };
 }
 
+function isMobileUserAgent(userAgent) {
+  return /Android|iPhone|Mobile/i.test(userAgent);
+}
+
+function getViewportForUserAgent(userAgent) {
+  if (isMobileUserAgent(userAgent)) {
+    return { width: 375, height: 812, isMobile: true };
+  }
+
+  return { width: 1366, height: 768, isMobile: false };
+}
+
+function shouldBlockRequest(url, resourceType) {
+  if (resourceType === 'image' || resourceType === 'font') {
+    return true;
+  }
+
+  return /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|segment|mixpanel|clarity|pixel/i.test(url);
+}
+
 async function simulateHumanBehavior(page, config) {
   await sleep(randomInt(config.postLoadWaitMsMin, config.postLoadWaitMsMax));
 
@@ -49,6 +69,17 @@ async function simulateHumanBehavior(page, config) {
   await sleep(randomInt(config.preExtractWaitMsMin, config.preExtractWaitMsMax));
 }
 
+function detectBlockPageText(content) {
+  return /access denied|request blocked|forbidden|temporarily unavailable|bot detected|security check/i.test(content);
+}
+
+function parseJsonWithTolerance(raw) {
+  const withoutBlockComments = raw.replace(/\/\*[\s\S]*?\*\//g, '');
+  const withoutLineComments = withoutBlockComments.replace(/^\s*\/\/.*$/gm, '');
+  const withoutTrailingCommas = withoutLineComments.replace(/,\s*([}\]])/g, '$1');
+
+  return JSON.parse(withoutTrailingCommas);
+}
 
 async function ensureFiles() {
   await fs.mkdir(JSON_DIR, { recursive: true });
@@ -87,18 +118,10 @@ function sanitizeConfig() {
   cfg.maxRetries = Math.max(0, Number(cfg.maxRetries) || DEFAULT_CONFIG.maxRetries);
   cfg.retryDelayMsMin = Math.max(1000, Number(cfg.retryDelayMsMin) || DEFAULT_CONFIG.retryDelayMsMin);
   cfg.retryDelayMsMax = Math.max(cfg.retryDelayMsMin, Number(cfg.retryDelayMsMax) || DEFAULT_CONFIG.retryDelayMsMax);
+  cfg.preNavigationDelayMsMin = 2000;
+  cfg.preNavigationDelayMsMax = 5000;
 
   return cfg;
-}
-
-
-
-function parseJsonWithTolerance(raw) {
-  const withoutBlockComments = raw.replace(/\/\*[\s\S]*?\*\//g, '');
-  const withoutLineComments = withoutBlockComments.replace(/^\s*\/\/.*$/gm, '');
-  const withoutTrailingCommas = withoutLineComments.replace(/,\s*([}\]])/g, '$1');
-
-  return JSON.parse(withoutTrailingCommas);
 }
 
 function normalizeSelectors(selectors) {
@@ -152,28 +175,74 @@ async function readInputConfig() {
     throw new Error('url.json must include selectors object with field selectors');
   }
 
-  return {
-    urls: cleanUrls,
-    selectors
-  };
+  return { urls: cleanUrls, selectors };
 }
 
 async function writeJson(file, data) {
   await fs.writeFile(file, JSON.stringify(data, null, 2));
 }
 
-async function scrapeUrl(browser, url, selectors, config, index, total, pickUserAgent) {
-  const page = await browser.newPage();
-  const startedAt = new Date().toISOString();
+async function configurePageSession(page, userAgent, referer) {
+  const viewport = getViewportForUserAgent(userAgent);
 
-  try {
-    await page.setUserAgent(pickUserAgent());
-    await page.setViewport({ width: 1366, height: 768 });
+  await page.setUserAgent(userAgent);
+  await page.setViewport(viewport);
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    Referer: referer
+  });
 
-    const response = await page.goto(url, {
+  await page.setRequestInterception(true);
+  page.removeAllListeners('request');
+  page.on('request', (request) => {
+    if (shouldBlockRequest(request.url(), request.resourceType())) {
+      request.abort();
+      return;
+    }
+
+    request.continue();
+  });
+}
+
+function getHomepage(url) {
+  const parsed = new URL(url);
+  return `${parsed.protocol}//${parsed.host}/`;
+}
+
+async function navigateWithFlow(page, url, config) {
+  await sleep(randomInt(config.preNavigationDelayMsMin, config.preNavigationDelayMsMax));
+
+  if (Math.random() < 0.45) {
+    const homepage = getHomepage(url);
+    await page.goto(homepage, {
       waitUntil: 'domcontentloaded',
       timeout: config.navigationTimeoutMs
     });
+
+    await sleep(randomInt(1200, 3200));
+  }
+
+  return page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: config.navigationTimeoutMs
+  });
+}
+
+async function scrapeUrl(page, url, selectors, config, index, total, pickUserAgent) {
+  const startedAt = new Date().toISOString();
+
+  try {
+    const userAgent = pickUserAgent();
+    const homepage = getHomepage(url);
+
+    await configurePageSession(page, userAgent, homepage);
+    const response = await navigateWithFlow(page, url, config);
+
+    const pageText = await page.evaluate(() => document.body?.innerText || '');
+    if (detectBlockPageText(pageText)) {
+      throw new Error('Block page detected by content scan');
+    }
 
     await simulateHumanBehavior(page, config);
 
@@ -209,10 +278,7 @@ async function scrapeUrl(browser, url, selectors, config, index, total, pickUser
           }
         }
 
-        fields[fieldName] = {
-          value,
-          matchedSelector
-        };
+        fields[fieldName] = { value, matchedSelector };
       }
 
       return {
@@ -245,14 +311,12 @@ async function scrapeUrl(browser, url, selectors, config, index, total, pickUser
       endedAt: new Date().toISOString(),
       error: error.message
     };
-  } finally {
-    await page.close();
   }
 }
 
-async function scrapeWithRetry(browser, url, selectors, config, index, total, pickUserAgent) {
+async function scrapeWithRetry(page, url, selectors, config, index, total, pickUserAgent) {
   for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
-    const result = await scrapeUrl(browser, url, selectors, config, index, total, pickUserAgent);
+    const result = await scrapeUrl(page, url, selectors, config, index, total, pickUserAgent);
 
     if (result.status === 'success') {
       return result;
@@ -275,39 +339,47 @@ async function scrapeWithRetry(browser, url, selectors, config, index, total, pi
   };
 }
 
-
 async function runPool(urls, selectors, config) {
   const browser = await puppeteer.launch({
     headless: config.headless,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
 
-  const results = [];
-  let cursor = 0;
-  const pickUserAgent = createUserAgentPicker();
-
-  const worker = async () => {
-    while (cursor < urls.length) {
-      const index = cursor++;
-      const url = urls[index];
-
-      const result = await scrapeWithRetry(browser, url, selectors, config, index, urls.length, pickUserAgent);
-      results[index] = result;
-
-      await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
-    }
-  };
-
-  const workerTasks = Array.from({ length: Math.min(config.concurrency, urls.length) }, () => worker());
+  const context = await browser.createBrowserContext();
 
   try {
-    await Promise.all(workerTasks);
+    const pagePool = await Promise.all(
+      Array.from({ length: Math.min(config.concurrency, urls.length) }, () => context.newPage())
+    );
+
+    const results = [];
+    let cursor = 0;
+    const pickUserAgent = createUserAgentPicker();
+
+    const worker = async (page) => {
+      while (cursor < urls.length) {
+        const index = cursor++;
+        const url = urls[index];
+
+        const result = await scrapeWithRetry(page, url, selectors, config, index, urls.length, pickUserAgent);
+        results[index] = result;
+
+        await sleep(randomInt(config.minDelayMs, config.maxDelayMs));
+      }
+    };
+
+    await Promise.all(pagePool.map((page) => worker(page)));
+
+    for (const page of pagePool) {
+      await page.close();
+    }
+
     return results;
   } finally {
+    await context.close();
     await browser.close();
   }
 }
-
 
 (async () => {
   try {
@@ -316,7 +388,7 @@ async function runPool(urls, selectors, config) {
     const { urls, selectors } = await readInputConfig();
     const config = sanitizeConfig();
 
-    console.log(`Starting scrape for ${urls.length} URLs in one browser instance...`);
+    console.log(`Starting scrape for ${urls.length} URLs in one browser context...`);
 
     const results = await runPool(urls, selectors, config);
     const output = results.filter((entry) => entry.status === 'success');
